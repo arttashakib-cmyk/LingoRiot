@@ -21,18 +21,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================================
-      # مرحله ۱: پیدا کردن زیپ و باز کردن کامل آن
-      # ============================================================
       - name: Unzip project and flatten all files
         id: unzip
         run: |
           set -e
-
           echo "=== Searching for zip file ==="
           ls -la
 
-          # پیدا کردن فایل زیپ
           ZIP_FILE=""
           if [ -f "LingoRiot-source.zip" ]; then
             ZIP_FILE="LingoRiot-source.zip"
@@ -43,9 +38,8 @@ jobs:
           fi
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "No zip file found in root. Trying to build from existing source..."
+            echo "No zip file found. Trying existing source..."
             if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
-              echo "Source already present in root."
               echo "PROJECT_DIR=." >> $GITHUB_OUTPUT
               exit 0
             else
@@ -55,22 +49,11 @@ jobs:
           fi
 
           echo "Found zip: $ZIP_FILE"
-          echo "=== Extracting zip ==="
-
-          # پاک کردن پوشه‌های قبلی
           rm -rf extracted _project_tmp
-
-          # باز کردن زیپ
           mkdir -p extracted
           unzip -o -q "$ZIP_FILE" -d extracted
 
-          echo "=== Contents after unzip ==="
-          find extracted -maxdepth 3 -type d | head -30
-          ls -la extracted/
-
-          # پیدا کردن ریشه واقعی پروژه (جایی که settings.gradle.kts هست)
           SETTINGS_FILE=$(find extracted -name "settings.gradle.kts" -o -name "settings.gradle" | head -1)
-
           if [ -z "$SETTINGS_FILE" ]; then
             echo "ERROR: settings.gradle.kts not found inside zip!"
             find extracted -type f | head -50
@@ -78,61 +61,43 @@ jobs:
           fi
 
           PROJECT_ROOT=$(dirname "$SETTINGS_FILE")
-          echo "Real project root inside zip: $PROJECT_ROOT"
+          echo "Real project root: $PROJECT_ROOT"
 
-          # تمام فایل‌های پروژه را به ریشه workspace منتقل کن
-          echo "=== Moving all project files to workspace root ==="
           mkdir -p _project_tmp
           cp -a "$PROJECT_ROOT"/. _project_tmp/
 
-          # پاک کردن محتویات فعلی ریشه (به جز .git و خود زیپ)
           find . -maxdepth 1 ! -name '.' ! -name '..' ! -name '.git' ! -name '*.zip' ! -name '_project_tmp' -exec rm -rf {} +
-
-          # انتقال فایل‌های پروژه به ریشه
           cp -a _project_tmp/. .
           rm -rf _project_tmp extracted
 
-          echo "=== Final workspace contents ==="
           ls -la
-
-          # اطمینان از وجود فایل‌های کلیدی
-          if [ ! -f "settings.gradle.kts" ] && [ ! -f "settings.gradle" ]; then
-            echo "ERROR: settings.gradle.kts still missing after flatten!"
+          if [ ! -f "settings.gradle.kts" ]; then
+            echo "ERROR: settings.gradle.kts missing after flatten!"
             exit 1
           fi
-
-          if [ ! -f "app/build.gradle.kts" ] && [ ! -f "app/build.gradle" ]; then
-            echo "ERROR: app/build.gradle.kts missing!"
-            exit 1
-          fi
-
           echo "PROJECT_DIR=." >> $GITHUB_OUTPUT
-          echo "✅ Unzip and flatten completed successfully"
+          echo "✅ Unzip completed"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: 'gradle'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
         with:
-          path: |
-            \~/.gradle/caches
-            \~/.gradle/wrapper
-          key: gradle-\( {{ runner.os }}- \){{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
+          packages: 'tools platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
 
       - name: Ensure Gradle Wrapper exists
         run: |
           set -e
           if [ ! -f "./gradlew" ]; then
-            echo "gradlew not found – generating it..."
+            echo "Generating gradlew..."
             sudo apt-get update -qq
             sudo apt-get install -y -qq wget unzip > /dev/null
             wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip -O /tmp/gradle.zip
@@ -144,12 +109,10 @@ jobs:
 
       - name: Run unit tests
         continue-on-error: true
-        run: |
-          ./gradlew test --stacktrace --no-daemon || true
+        run: ./gradlew test --stacktrace --no-daemon || true
 
       - name: Build Debug APK
-        run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Find and upload APK
         id: apk
@@ -160,7 +123,7 @@ jobs:
             APK=$(find . -name "*.apk" | head -1)
           fi
           if [ -z "$APK" ]; then
-            echo "ERROR: No APK found after build!"
+            echo "ERROR: No APK found!"
             find . -name "*.apk" || true
             exit 1
           fi
@@ -175,10 +138,3 @@ jobs:
           path: ${{ steps.apk.outputs.APK_PATH }}
           retention-days: 30
           if-no-files-found: error
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "### ✅ LingoRiot Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Zip was automatically extracted and flattened" >> $GITHUB_STEP_SUMMARY
-          echo "- APK artifact name: **LingoRiot-debug-apk**" >> $GITHUB_STEP_SUMMARY
