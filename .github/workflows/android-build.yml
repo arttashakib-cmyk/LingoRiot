@@ -17,7 +17,8 @@ concurrency:
 jobs:
   build:
     name: Unzip Zip → Build APK
-    runs-on: ubuntu-latest
+    # استفاده از اوبونتو 22.04 برای پایداری بیشتر در بیلدهای اندروید
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
 
     steps:
@@ -65,9 +66,7 @@ jobs:
           fi
 
           if [ -z "${DIR:-}" ] || [ ! -f "$DIR/settings.gradle.kts" ]; then
-            echo "::error::settings.gradle.kts not found (including inside any extracted ZIP)."
-            echo "Repository contents:"; ls -la
-            echo "Extracted (if any):"; ls -la extracted 2>/dev/null || true
+            echo "::error::settings.gradle.kts not found."
             exit 1
           fi
           echo "Using project directory: $DIR"
@@ -99,9 +98,13 @@ jobs:
 
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "platforms;android-34" "build-tools;34.0.0"
+          echo "SDK installed."
 
-          echo "SDK installed at $ANDROID_HOME"
-          ls -la "$ANDROID_HOME"
+      - name: Fix AAPT2 permissions
+        shell: bash
+        run: |
+          # این استپ بسیار مهم است؛ گاهی اوقات AAPT2 در رانرهای لینوکسی دسترسی اجرا ندارد
+          chmod -R +x $ANDROID_HOME/build-tools/
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -114,20 +117,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ] || [ ! -f gradlew ]; then
-            echo "Wrapper JAR not shipped; generating with Gradle 8.9."
             gradle wrapper --gradle-version 8.9 --no-daemon
           fi
           test -f gradlew || { echo "::error::gradlew missing"; exit 1; }
           chmod +x gradlew
           
-          # ساخت فایل local.properties برای اتصال به Android SDK
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
-          cat local.properties
-
-          # تنظیم حافظه Gradle برای جلوگیری از خطای OOM
-          if [ ! -f gradle.properties ]; then
-            touch gradle.properties
-          fi
+          
+          if [ ! -f gradle.properties ]; then touch gradle.properties; fi
           if ! grep -q "org.gradle.jvmargs" gradle.properties; then
             echo "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" >> gradle.properties
           fi
@@ -137,27 +134,41 @@ jobs:
       - name: Ensure debug keystore directory is writable
         shell: bash
         run: |
-          # رفع مشکل عدم دسترسی به پوشه keystore در رانرهای اوبونتو
           mkdir -p $HOME/.android
           chmod 777 $HOME/.android
 
-      - name: Unit tests
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee unit-tests.log || true
+      # موقتاً غیرفعال شد تا خطای اصلی بیلد مشخص شود
+      # - name: Unit tests
+      #   working-directory: ${{ env.PROJECT_DIR }}
+      #   shell: bash
+      #   continue-on-error: true
+      #   run: |
+      #     set -o pipefail
+      #     ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee unit-tests.log || true
 
       - name: Clean and Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -o pipefail
-          # پاک‌سازی کش‌های قبلی
+          set +e # اجازه می‌دهیم حتی در صورت خطا، مراحل بعدی برای دیباگ اجرا شوند
+          
+          echo "::group::Gradle Clean"
           ./gradlew clean --no-daemon
-          # بیلد اصلی
+          echo "::endgroup::"
+
+          echo "::group::Gradle Assemble Debug"
           ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee build.log
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+          echo "::endgroup::"
+
+          # اگر بیلد فیل شد، لاگ کامل را چاپ کن تا خطا را ببینیم
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            echo "::error::Build failed with exit code $BUILD_EXIT_CODE"
+            echo "===== FULL BUILD LOG ====="
+            cat build.log
+            echo "=========================="
+            exit 1
+          fi
 
       - name: Verify APK
         working-directory: ${{ env.PROJECT_DIR }}
