@@ -7,134 +7,152 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: lingoriot-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Unzip Zip → Build APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    permissions:
-      contents: read
-      actions: write
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Unzip project and flatten all files
-        id: unzip
+      - name: Extract ZIP if present
+        shell: bash
         run: |
-          set -e
-          echo "=== Searching for zip file ==="
-          ls -la
-
-          ZIP_FILE=""
-          if [ -f "LingoRiot-source.zip" ]; then
-            ZIP_FILE="LingoRiot-source.zip"
-          elif [ -f "LingoRiot.zip" ]; then
-            ZIP_FILE="LingoRiot.zip"
+          set -euo pipefail
+          ZIP="$(find . -maxdepth 2 -type f -iname '*.zip' -not -path './.git/*' -print -quit || true)"
+          if [ -n "${ZIP:-}" ]; then
+            echo "Found archive: $ZIP -> extracting into ./extracted"
+            mkdir -p extracted
+            unzip -q -o "$ZIP" -d extracted
+            echo "Extracted contents:"
+            ls -la extracted
+            if [ -d extracted/LingoRiot ] && [ -f extracted/LingoRiot/settings.gradle.kts ]; then
+              echo "Moving LingoRiot/ contents to extracted/"
+              shopt -s dotglob
+              mv extracted/LingoRiot/* extracted/ 2>/dev/null || true
+              rmdir extracted/LingoRiot 2>/dev/null || true
+            fi
           else
-            ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" -type f | head -1)
+            echo "No ZIP archive found; using repository files as-is."
           fi
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No zip file found. Trying existing source..."
-            if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
-              echo "PROJECT_DIR=." >> $GITHUB_OUTPUT
-              exit 0
+      - name: Locate Gradle project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "./settings.gradle.kts" ] && [ -d "./app" ]; then
+            DIR="."
+          elif [ -f "./LingoRiot/settings.gradle.kts" ]; then
+            DIR="LingoRiot"
+          elif [ -f "./extracted/settings.gradle.kts" ]; then
+            DIR="extracted"
+          else
+            CAND="$(find . -maxdepth 5 -name settings.gradle.kts -not -path './.git/*' -print -quit || true)"
+            if [ -n "${CAND:-}" ]; then
+              DIR="$(dirname "$CAND")"
             else
-              echo "ERROR: Neither zip nor source found!"
-              exit 1
+              DIR=""
             fi
           fi
 
-          echo "Found zip: $ZIP_FILE"
-          rm -rf extracted _project_tmp
-          mkdir -p extracted
-          unzip -o -q "$ZIP_FILE" -d extracted
-
-          SETTINGS_FILE=$(find extracted -name "settings.gradle.kts" -o -name "settings.gradle" | head -1)
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "ERROR: settings.gradle.kts not found inside zip!"
-            find extracted -type f | head -50
+          if [ -z "${DIR:-}" ] || [ ! -f "$DIR/settings.gradle.kts" ]; then
+            echo "::error::settings.gradle.kts not found (including inside any extracted ZIP)."
+            echo "Repository contents:"; ls -la
+            echo "Extracted (if any):"; ls -la extracted 2>/dev/null || true
             exit 1
           fi
-
-          PROJECT_ROOT=$(dirname "$SETTINGS_FILE")
-          echo "Real project root: $PROJECT_ROOT"
-
-          mkdir -p _project_tmp
-          cp -a "$PROJECT_ROOT"/. _project_tmp/
-
-          find . -maxdepth 1 ! -name '.' ! -name '..' ! -name '.git' ! -name '*.zip' ! -name '_project_tmp' -exec rm -rf {} +
-          cp -a _project_tmp/. .
-          rm -rf _project_tmp extracted
-
-          ls -la
-          if [ ! -f "settings.gradle.kts" ]; then
-            echo "ERROR: settings.gradle.kts missing after flatten!"
-            exit 1
-          fi
-          echo "PROJECT_DIR=." >> $GITHUB_OUTPUT
-          echo "✅ Unzip completed"
+          echo "Using project directory: $DIR"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'gradle'
+          distribution: temurin
+          java-version: 17
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="\( {ANDROID_HOME:- \){ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK" ]; then echo "::error::ANDROID_HOME is not set on this runner"; exit 1; fi
+          echo "ANDROID_HOME=$SDK"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "\( SDKMANAGER" ]; then SDKMANAGER=" \)(command -v sdkmanager || true)"; fi
+          if [ -z "$SDKMANAGER" ]; then echo "::error::sdkmanager not found"; exit 1; fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          packages: 'tools platform-tools platforms;android-35 build-tools;35.0.0'
+          gradle-version: "8.9"
 
-      - name: Accept Android licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Ensure Gradle Wrapper exists
+      - name: Prepare Gradle wrapper
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
         run: |
-          set -e
-          if [ ! -f "./gradlew" ]; then
-            echo "Generating gradlew..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq wget unzip > /dev/null
-            wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip -O /tmp/gradle.zip
-            unzip -q /tmp/gradle.zip -d /tmp
-            /tmp/gradle-8.9/bin/gradle wrapper --gradle-version 8.9
+          set -euo pipefail
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ] || [ ! -f gradlew ]; then
+            echo "Wrapper JAR not shipped in the archive; generating it with Gradle 8.9."
+            gradle wrapper --gradle-version 8.9 --no-daemon
           fi
+          test -f gradlew || { echo "::error::gradlew missing"; exit 1; }
           chmod +x gradlew
-          ./gradlew --version
+          if [ ! -f local.properties ]; then
+            echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          fi
 
-      - name: Run unit tests
+      - name: Unit tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
         continue-on-error: true
-        run: ./gradlew test --stacktrace --no-daemon || true
-
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace --no-daemon
-
-      - name: Find and upload APK
-        id: apk
         run: |
-          set -e
-          APK=$(find . -name "*.apk" -path "*/outputs/apk/debug/*" | head -1)
-          if [ -z "$APK" ]; then
-            APK=$(find . -name "*.apk" | head -1)
-          fi
-          if [ -z "$APK" ]; then
-            echo "ERROR: No APK found!"
-            find . -name "*.apk" || true
-            exit 1
-          fi
-          echo "Found APK: $APK"
-          ls -lh "$APK"
-          echo "APK_PATH=$APK" >> $GITHUB_OUTPUT
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest 2>&1 | tee unit-tests.log || true
 
-      - name: Upload APK as Artifact
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee build.log
+
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(ls app/build/outputs/apk/debug/*.apk | head -n 1)"
+          test -s "$APK" || { echo "::error::APK missing or empty"; exit 1; }
+          cp "$APK" LingoRiot-debug.apk
+          ls -lh LingoRiot-debug.apk
+          echo "APK size: $(stat -c%s LingoRiot-debug.apk) bytes"
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: LingoRiot-debug-apk
-          path: ${{ steps.apk.outputs.APK_PATH }}
-          retention-days: 30
+          path: ${{ env.PROJECT_DIR }}/LingoRiot-debug.apk
           if-no-files-found: error
+
+      - name: Upload logs and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LingoRiot-build-logs
+          path: |
+            ${{ env.PROJECT_DIR }}/*.log
+            ${{ env.PROJECT_DIR }}/app/build/reports/tests
+            ${{ env.PROJECT_DIR }}/app/build/test-results
+          if-no-files-found: ignore
